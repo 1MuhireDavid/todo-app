@@ -1,0 +1,272 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>To-Do — ECS Fargate + RDS Proxy + ElastiCache</title>
+  <style>
+    :root {
+      --bg: #0f1115;
+      --panel: #171a21;
+      --line: #262b36;
+      --text: #e6e9ef;
+      --muted: #99a1b3;
+      --hit: #2fbf71;
+      --miss: #e0a33e;
+      --accent: #5b9dff;
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      padding: 32px 16px 64px;
+      background: var(--bg);
+      color: var(--text);
+      font: 15px/1.5 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    }
+
+    main { max-width: 720px; margin: 0 auto; }
+
+    h1 { font-size: 20px; margin: 0 0 4px; letter-spacing: -0.01em; }
+
+    .subtitle { color: var(--muted); font-size: 13px; margin: 0 0 24px; }
+
+    .panel {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      padding: 16px;
+      margin-bottom: 16px;
+    }
+
+    /* The point of the whole exercise: every read says where it came from. */
+    .telemetry { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; }
+
+    .badge {
+      font-weight: 650;
+      font-size: 12px;
+      letter-spacing: 0.06em;
+      padding: 5px 10px;
+      border-radius: 999px;
+      border: 1px solid currentColor;
+    }
+
+    .badge.hit { color: var(--hit); }
+    .badge.miss { color: var(--miss); }
+    .badge.idle { color: var(--muted); }
+
+    .metric { font-size: 13px; color: var(--muted); }
+    .metric strong { color: var(--text); font-variant-numeric: tabular-nums; font-weight: 600; }
+
+    form { display: flex; gap: 8px; }
+
+    input[type="text"] {
+      flex: 1;
+      background: #0c0e13;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 10px 12px;
+      color: var(--text);
+      font: inherit;
+    }
+
+    input[type="text"]:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+
+    button {
+      background: var(--accent);
+      border: 0;
+      border-radius: 8px;
+      padding: 10px 16px;
+      color: #07101f;
+      font: inherit;
+      font-weight: 600;
+      cursor: pointer;
+    }
+
+    button.ghost {
+      background: transparent;
+      border: 1px solid var(--line);
+      color: var(--text);
+      font-weight: 500;
+      padding: 8px 12px;
+    }
+
+    button:disabled { opacity: 0.5; cursor: default; }
+
+    ul { list-style: none; margin: 0; padding: 0; }
+
+    li {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      padding: 11px 0;
+      border-bottom: 1px solid var(--line);
+    }
+
+    li:last-child { border-bottom: 0; }
+
+    li .title { flex: 1; }
+    li.done .title { text-decoration: line-through; color: var(--muted); }
+
+    .row-actions button { background: transparent; color: var(--muted); padding: 4px 8px; font-size: 13px; }
+    .row-actions button:hover { color: #ff6b6b; }
+
+    .empty, .error { color: var(--muted); font-size: 14px; padding: 8px 0; }
+    .error { color: #ff8080; }
+
+    footer { color: var(--muted); font-size: 12px; margin-top: 24px; line-height: 1.7; }
+    code { background: #0c0e13; padding: 1px 5px; border-radius: 4px; font-size: 12px; }
+  </style>
+</head>
+<body>
+<main>
+  <h1>To-Do</h1>
+  <p class="subtitle">ECS Fargate &rarr; RDS Proxy &rarr; PostgreSQL, with reads cached in ElastiCache Redis.</p>
+
+  <section class="panel">
+    <div class="telemetry">
+      <span id="badge" class="badge idle">NO READ YET</span>
+      <span class="metric">served by <strong id="source">&mdash;</strong></span>
+      <span class="metric">server <strong id="server-ms">&mdash;</strong></span>
+      <span class="metric">round trip <strong id="client-ms">&mdash;</strong></span>
+      <button class="ghost" id="refresh" type="button">Read again</button>
+    </div>
+    <p class="metric" style="margin: 12px 0 0">
+      First read after any write is a miss and repopulates the cache. Read again
+      within the TTL and it is a hit. Entries also expire on their own.
+    </p>
+  </section>
+
+  <section class="panel">
+    <form id="add-form">
+      <input type="text" id="title" placeholder="What needs doing?" maxlength="200" autocomplete="off" required>
+      <button type="submit">Add</button>
+    </form>
+  </section>
+
+  <section class="panel">
+    <div id="error" class="error" hidden></div>
+    <ul id="list"></ul>
+    <div id="empty" class="empty" hidden>Nothing here yet.</div>
+  </section>
+
+  <footer>
+    A write goes straight to PostgreSQL through the proxy and deletes the keys it
+    affected &mdash; <code>tasks:all</code> and <code>task:&lt;id&gt;</code> &mdash;
+    rather than rewriting them, so the cache can never hold a value the database
+    never had.
+  </footer>
+</main>
+
+<script>
+  const el = (id) => document.getElementById(id);
+
+  function renderTelemetry(result, clientMs) {
+    const badge = el('badge');
+    badge.className = 'badge ' + (result.cacheHit ? 'hit' : 'miss');
+    badge.textContent = result.cacheHit ? 'CACHE HIT' : 'CACHE MISS';
+    el('source').textContent = result.source;
+    el('server-ms').textContent = result.elapsedMs.toFixed(2) + ' ms';
+    el('client-ms').textContent = clientMs.toFixed(1) + ' ms';
+  }
+
+  function showError(message) {
+    const box = el('error');
+    box.textContent = message;
+    box.hidden = !message;
+  }
+
+  function render(items) {
+    const list = el('list');
+    list.innerHTML = '';
+    el('empty').hidden = items.length > 0;
+
+    for (const task of items) {
+      const li = document.createElement('li');
+      li.className = task.completed ? 'done' : '';
+
+      const check = document.createElement('input');
+      check.type = 'checkbox';
+      check.checked = task.completed;
+      check.addEventListener('change', () => toggle(task, check.checked));
+
+      const title = document.createElement('span');
+      title.className = 'title';
+      title.textContent = task.title;
+
+      const actions = document.createElement('span');
+      actions.className = 'row-actions';
+      const del = document.createElement('button');
+      del.type = 'button';
+      del.textContent = 'Delete';
+      del.addEventListener('click', () => remove(task.id));
+      actions.appendChild(del);
+
+      li.append(check, title, actions);
+      list.appendChild(li);
+    }
+  }
+
+  async function load() {
+    el('refresh').disabled = true;
+    // Measured here as well as on the server, so the panel shows both the
+    // backend read time and the full round trip the browser actually felt.
+    const started = performance.now();
+    try {
+      const response = await fetch('/api/tasks', { cache: 'no-store' });
+      if (!response.ok) throw new Error('read failed with HTTP ' + response.status);
+      const result = await response.json();
+      renderTelemetry(result, performance.now() - started);
+      render(result.data);
+      showError('');
+    } catch (e) {
+      showError(e.message);
+    } finally {
+      el('refresh').disabled = false;
+    }
+  }
+
+  async function toggle(task, completed) {
+    await send('PUT', '/api/tasks/' + task.id, { title: task.title, completed });
+  }
+
+  async function remove(id) {
+    await send('DELETE', '/api/tasks/' + id, null);
+  }
+
+  async function send(method, url, body) {
+    try {
+      const response = await fetch(url, {
+        method,
+        headers: body ? { 'Content-Type': 'application/json' } : {},
+        body: body ? JSON.stringify(body) : undefined
+      });
+      if (!response.ok) {
+        const detail = await response.json().catch(() => ({}));
+        throw new Error(detail.error || (method + ' failed with HTTP ' + response.status));
+      }
+      showError('');
+      // The write just invalidated the list key, so this read is a miss by
+      // construction - which is exactly what the panel should show.
+      await load();
+    } catch (e) {
+      showError(e.message);
+    }
+  }
+
+  el('add-form').addEventListener('submit', async (event) => {
+    event.preventDefault();
+    const input = el('title');
+    const title = input.value.trim();
+    if (!title) return;
+    input.value = '';
+    await send('POST', '/api/tasks', { title });
+  });
+
+  el('refresh').addEventListener('click', load);
+
+  load();
+</script>
+</body>
+</html>

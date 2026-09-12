@@ -1,0 +1,48 @@
+{
+  "family": "__TASK_FAMILY__",
+  "networkMode": "awsvpc",
+  "requiresCompatibilities": ["FARGATE"],
+  "cpu": "512",
+  "memory": "1024",
+  "executionRoleArn": "__EXECUTION_ROLE_ARN__",
+  "taskRoleArn": "__TASK_ROLE_ARN__",
+  "runtimePlatform": {
+    "cpuArchitecture": "X86_64",
+    "operatingSystemFamily": "LINUX"
+  },
+  "containerDefinitions": [
+    {
+      "name": "__CONTAINER_NAME__",
+      "image": "<IMAGE1_NAME>",
+      "essential": true,
+      "portMappings": [
+        {
+          "containerPort": 8080,
+          "protocol": "tcp"
+        }
+      ],
+      "environment": [
+        { "name": "SERVER_PORT", "value": "8080" },
+        { "name": "DB_HOST", "value": "__DB_HOST__" },
+        { "name": "DB_PORT", "value": "__DB_PORT__" },
+        { "name": "DB_NAME", "value": "__DB_NAME__" },
+        { "name": "REDIS_HOST", "value": "__REDIS_HOST__" },
+        { "name": "REDIS_PORT", "value": "__REDIS_PORT__" },
+        { "name": "CACHE_TTL_SECONDS", "value": "60" }
+      ],
+      "secrets": [
+        { "name": "DB_USERNAME", "valueFrom": "__DB_SECRET_ARN__:username::" },
+        { "name": "DB_PASSWORD", "valueFrom": "__DB_SECRET_ARN__:password::" },
+        { "name": "REDIS_AUTH_TOKEN", "valueFrom": "__REDIS_SECRET_ARN__:authToken::" }
+      ],
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "__LOG_GROUP__",
+          "awslogs-region": "__AWS_REGION__",
+          "awslogs-stream-prefix": "app"
+        }
+      }
+    }
+  ]
+}

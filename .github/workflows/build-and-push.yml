@@ -1,0 +1,249 @@
+name: Build and push
+
+# Builds the image, publishes the deploy bundle, and then pushes the deployed
+# tag - which is what actually starts the pipeline.
+#
+# Ordering matters and is not incidental:
+#   1. push sha-<short>    immutable, and does not trigger anything
+#   2. upload the bundle   so the S3 source action has the matching taskdef
+#   3. push latest         the EventBridge rule fires on this and only this
+# Pushing latest first would race the pipeline against the bundle upload and
+# could deploy the previous commit's task definition with the new image.
+#
+# Bootstrap run. The infrastructure stack cannot be created until an image
+# tagged latest exists - the tasks run with no internet route, so a missing
+# image cannot fall back to a public registry - but rendering taskdef.json
+# needs that same stack's outputs. The way out is that only the render step
+# needs the stack; building and pushing the image needs nothing but ECR.
+# So this workflow detects which phase it is in and, on the first run, publishes
+# the image and skips the deploy bundle. Nothing is listening yet anyway: the
+# EventBridge rule and the pipeline are created by the stack this run unblocks.
+# No manual docker commands, and the same workflow handles both phases.
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "src/**"
+      - "pom.xml"
+      - "Dockerfile"
+      - "ecs/**"
+      - ".github/workflows/build-and-push.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: build-and-push
+  cancel-in-progress: false
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: us-east-1
+  AWS_ROLE_ARN: arn:aws:iam::047719661196:role/todo-app-gha-app-build
+  ECR_REPOSITORY: todo-app
+  ROOT_STACK_NAME: todo-app
+  ARTIFACT_BUCKET: todo-app-pipeline-artifacts-047719661196-us-east-1
+  BUNDLE_KEY: source/deploy-templates.zip
+  DEPLOY_TAG: latest
+
+jobs:
+  build:
+    name: Build image and publish deploy bundle
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: build-and-push-${{ github.run_id }}
+
+      - name: Log in to Amazon ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build image
+        id: image
+        env:
+          REGISTRY: ${{ steps.ecr.outputs.registry }}
+        run: |
+          set -euo pipefail
+          short="$(git rev-parse --short=12 HEAD)"
+          echo "sha_tag=sha-${short}" >> "$GITHUB_OUTPUT"
+          docker build \
+            --tag "${REGISTRY}/${ECR_REPOSITORY}:sha-${short}" \
+            --tag "${REGISTRY}/${ECR_REPOSITORY}:${DEPLOY_TAG}" \
+            .
+
+      - name: Push immutable sha tag
+        env:
+          REGISTRY: ${{ steps.ecr.outputs.registry }}
+          SHA_TAG: ${{ steps.image.outputs.sha_tag }}
+        run: |
+          set -euo pipefail
+          # Does not trigger the pipeline - the EventBridge rule filters on the
+          # deployed tag. This tag is what a rollback re-tags from.
+          docker push "${REGISTRY}/${ECR_REPOSITORY}:${SHA_TAG}"
+
+      - name: Detect infrastructure stack
+        id: infra
+        run: |
+          set -euo pipefail
+
+          # describe-stacks errors on a stack that does not exist, so tolerate a
+          # failure here rather than letting set -e end the run.
+          status="$(aws cloudformation describe-stacks \
+            --stack-name "$ROOT_STACK_NAME" \
+            --query 'Stacks[0].StackStatus' \
+            --output text 2>/dev/null || echo "NOT_FOUND")"
+
+          case "$status" in
+            CREATE_COMPLETE|UPDATE_COMPLETE|UPDATE_ROLLBACK_COMPLETE|IMPORT_COMPLETE)
+              ready=true
+              ;;
+            *)
+              # Includes NOT_FOUND and any *_IN_PROGRESS. Mid-create counts as
+              # not ready: the outputs may exist while the service does not, and
+              # a deployment started against a half-built stack just fails.
+              ready=false
+              ;;
+          esac
+
+          echo "status=${status}" >> "$GITHUB_OUTPUT"
+          echo "ready=${ready}" >> "$GITHUB_OUTPUT"
+          echo "Stack ${ROOT_STACK_NAME}: ${status} (deploy bundle ${ready})"
+
+      - name: Render task definition from stack outputs
+        if: steps.infra.outputs.ready == 'true'
+        run: |
+          set -euo pipefail
+
+          # The generated, account-specific values - role ARNs, the proxy and
+          # Redis endpoints, the two secret ARNs - are read from the
+          # infrastructure stack rather than committed here. They change when
+          # the stack is rebuilt, and a stale copy in this repository would
+          # deploy a task pointing at a database that no longer exists.
+          outputs="$(aws cloudformation describe-stacks \
+            --stack-name "$ROOT_STACK_NAME" \
+            --query "Stacks[0].Outputs" \
+            --output json)"
+
+          # Deliberately does not exit on a missing key: this runs inside a
+          # command substitution, where exit would only kill the subshell and
+          # leave an empty value that silently substitutes away the placeholder.
+          # The emptiness check happens in the substitution loop below instead.
+          get() {
+            echo "$outputs" | jq -r --arg k "$1" '.[] | select(.OutputKey==$k) | .OutputValue'
+          }
+
+          mkdir -p build/deploy
+          cp ecs/appspec.yaml build/deploy/appspec.yaml
+          cp ecs/taskdef.json build/deploy/taskdef.json
+
+          declare -A VALUES=(
+            ["__TASK_FAMILY__"]="$(get TaskFamily)"
+            ["__CONTAINER_NAME__"]="$(get ContainerName)"
+            ["__EXECUTION_ROLE_ARN__"]="$(get ExecutionRoleArn)"
+            ["__TASK_ROLE_ARN__"]="$(get TaskRoleArn)"
+            ["__DB_HOST__"]="$(get DatabaseProxyEndpoint)"
+            ["__DB_PORT__"]="$(get DatabasePort)"
+            ["__DB_NAME__"]="$(get DatabaseName)"
+            ["__DB_SECRET_ARN__"]="$(get DatabaseSecretArn)"
+            ["__REDIS_HOST__"]="$(get RedisEndpoint)"
+            ["__REDIS_PORT__"]="$(get RedisPort)"
+            ["__REDIS_SECRET_ARN__"]="$(get RedisAuthSecretArn)"
+            ["__LOG_GROUP__"]="$(get LogGroupName)"
+            ["__AWS_REGION__"]="${AWS_REGION}"
+          )
+
+          for placeholder in "${!VALUES[@]}"; do
+            value="${VALUES[$placeholder]}"
+            if [[ -z "$value" || "$value" == "null" ]]; then
+              echo "::error::Stack ${ROOT_STACK_NAME} produced no value for ${placeholder}. The infrastructure stack and this workflow have drifted apart - check the Outputs block of cfn/root.yaml."
+              exit 1
+            fi
+            # Pipe delimiter: every one of these values contains slashes or colons.
+            sed -i "s|${placeholder}|${value}|g" build/deploy/taskdef.json
+          done
+
+          if grep -q "__" build/deploy/taskdef.json; then
+            echo "::error::Unsubstituted placeholder left in taskdef.json:"
+            grep -n "__" build/deploy/taskdef.json
+            exit 1
+          fi
+
+          # <IMAGE1_NAME> must survive: CodePipeline replaces it with the image
+          # URI from the ECR source artifact at deploy time.
+          if ! grep -q "<IMAGE1_NAME>" build/deploy/taskdef.json; then
+            echo "::error::<IMAGE1_NAME> placeholder is missing from taskdef.json - the deploy would use a literal image string."
+            exit 1
+          fi
+
+          jq empty build/deploy/taskdef.json
+          echo "Rendered task definition:"
+          jq '.containerDefinitions[0] | {name, image, environment, secrets}' build/deploy/taskdef.json
+
+      - name: Upload deploy bundle
+        if: steps.infra.outputs.ready == 'true'
+        run: |
+          set -euo pipefail
+          cd build/deploy
+          zip -q -r ../deploy-templates.zip appspec.yaml taskdef.json
+          cd ../..
+          aws s3api put-object \
+            --bucket "$ARTIFACT_BUCKET" \
+            --key "$BUNDLE_KEY" \
+            --body build/deploy-templates.zip \
+            --content-type application/zip \
+            --no-cli-pager >/dev/null
+
+      - name: Push deployed tag
+        env:
+          REGISTRY: ${{ steps.ecr.outputs.registry }}
+        run: |
+          set -euo pipefail
+          # Normal run: this push is the trigger, and the bundle is already in
+          # place above it.
+          # Bootstrap run: this is simply the image the stack needs in order to
+          # be created at all. The rule that would react to it does not exist
+          # yet, so nothing is triggered.
+          docker push "${REGISTRY}/${ECR_REPOSITORY}:${DEPLOY_TAG}"
+
+      - name: Summary
+        env:
+          REGISTRY: ${{ steps.ecr.outputs.registry }}
+          SHA_TAG: ${{ steps.image.outputs.sha_tag }}
+          STACK_STATUS: ${{ steps.infra.outputs.status }}
+          STACK_READY: ${{ steps.infra.outputs.ready }}
+        run: |
+          {
+            echo "| Item | Value |"
+            echo "| --- | --- |"
+            echo "| Image | \`${REGISTRY}/${ECR_REPOSITORY}\` |"
+            echo "| Immutable tag | \`${SHA_TAG}\` |"
+            echo "| Deployed tag | \`${DEPLOY_TAG}\` |"
+            echo "| Stack \`${ROOT_STACK_NAME}\` | \`${STACK_STATUS}\` |"
+            echo ""
+
+            if [[ "${STACK_READY}" == "true" ]]; then
+              echo "**Deployed.** Bundle published to \`s3://${ARTIFACT_BUCKET}/${BUNDLE_KEY}\`, then pushing \`${DEPLOY_TAG}\` raised an ECR push event. EventBridge started the pipeline, which is running the blue/green deploy now."
+              echo ""
+              echo "To roll back without rebuilding, re-tag \`${SHA_TAG}\` of a known-good build as \`${DEPLOY_TAG}\` and push it. Within the 10 minute termination wait, shifting traffic back to blue in the CodeDeploy console is faster still."
+            else
+              echo "**Bootstrap run - image published, no deployment.** The infrastructure stack is \`${STACK_STATUS}\`, so there were no outputs to render \`taskdef.json\` from and no pipeline to deploy with. The deploy bundle was skipped; that is expected on a first run."
+              echo ""
+              echo "\`${DEPLOY_TAG}\` now exists in ECR, which is the thing the stack was waiting for. Next:"
+              echo ""
+              echo "1. Let CloudFormation Git sync create the \`${ROOT_STACK_NAME}\` stack (~25 minutes)."
+              echo "2. Re-run this workflow. It will find the stack, render the task definition, publish the bundle and deploy for real."
+              echo ""
+              echo "If the stack does exist and you are seeing this anyway, check that the build role can call \`cloudformation:DescribeStacks\` on it - an AccessDenied is reported here the same way a missing stack is."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
