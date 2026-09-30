@@ -23,8 +23,6 @@ src/main/resources/
   application.properties            every value from the environment, no defaults
   static/index.html                 UI with the cache hit/miss indicator
 Dockerfile                          multi-stage, non-root runtime
-ecs/appspec.yaml                    CodeDeploy blue/green spec
-ecs/taskdef.json                    task definition template, rendered at build time
 .github/workflows/build-and-push.yml
 ```
 
@@ -113,37 +111,17 @@ sized with `-XX:MaxRAMPercentage=75.0` rather than a fixed `-Xmx`, so changing
 
 ## Deployment
 
-`build-and-push.yml` runs on a push to `main`. Ordering is deliberate:
+`build-and-push.yml` runs on a push to `main` and does two things: build the
+image, then push it as `sha-<short12>` and as `latest`. It never reads the
+infrastructure stack.
 
-1. `docker build`, then push `sha-<short12>` — immutable, and triggers nothing.
-2. Render `ecs/taskdef.json` from the infrastructure stack's outputs, zip it with
-   `appspec.yaml`, upload to the pipeline artifact bucket.
-3. Push `latest` — **this** is what the EventBridge rule fires on.
+The push of `latest` fires an EventBridge rule that starts the pipeline in
+`todo-app-infra`. There, a CodeBuild step writes `taskdef.json` and
+`appspec.yaml` from values CloudFormation passes it, and CodeDeploy runs the
+blue/green deploy with the new image.
 
-Pushing `latest` first would race the pipeline against the bundle upload and
-could deploy the previous commit's task definition alongside the new image.
-
-### The first run
-
-The infrastructure stack cannot be created until a `latest` image exists — the
-tasks have no internet route, so a missing image cannot fall back to a public
-registry — but step 2 needs that same stack's outputs. Only the render step
-needs the stack, though; building and pushing need nothing but ECR.
-
-So the workflow checks the stack first. If it is missing or mid-create, it
-publishes the image and skips steps 2 and 3's deploy semantics, telling you so
-in the job summary. Pushing `latest` triggers nothing at that point, because the
-EventBridge rule is created by the stack this run unblocks. Once Git sync has
-built the stack, re-run the same workflow and it deploys for real.
-
-No manual `docker` commands, and the two phases are the same workflow file.
-
-`taskdef.json` is committed with `__PLACEHOLDER__` markers for the values that
-are generated rather than guessable — role ARNs, the proxy and Redis endpoints,
-the two secret ARNs, the log group. The workflow fills them from
-`describe-stacks` on the `todo-app` stack, and fails the build if any placeholder
-survives or if `<IMAGE1_NAME>` does not. That last one matters: `<IMAGE1_NAME>`
-is CodePipeline's substitution marker for the image URI and must stay literal.
+On the very first run the stack does not exist yet, so nothing is listening and
+the push only makes `latest` available for the stack to be created with.
 
 **Rolling back** does not need a rebuild. Re-tag a known-good `sha-` image as
 `latest` and push it:
@@ -161,12 +139,11 @@ console — no deploy required.
 
 ## Keeping this in step with the infrastructure
 
-`06-alb-ecs.yaml` defines only the *bootstrap* task definition — the revision the
-service is created with. CloudFormation cannot update `TaskDefinition` on a
-service using the `CODE_DEPLOY` deployment controller, so every revision after
-the first comes from `ecs/taskdef.json` here.
+The task definition lives in `todo-app-infra`, in two places: `06-alb-ecs.yaml`
+holds the *bootstrap* revision the service is created with, and the `RenderProject`
+buildspec in `07-cicd-pipeline.yaml` produces every revision after it.
+CloudFormation cannot update `TaskDefinition` on a `CODE_DEPLOY` service, which
+is why the second copy exists.
 
 If you change the container shape — a new environment variable, a different port,
-another secret — change it in **both** files. The container name (`todo-app`)
-appears in three places: `06-alb-ecs.yaml`, `ecs/appspec.yaml` and
-`ecs/taskdef.json`.
+another secret — change it in **both** templates.

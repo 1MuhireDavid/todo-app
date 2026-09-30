@@ -16,9 +16,9 @@ would still ask "why".
 
 - **Explain why, never what.** If a comment restates the line below it, delete it.
 - **Never interrupt a block.** No comments between the fields of a class, between
-  the properties in `application.properties`, between JSON fields in
-  `ecs/taskdef.json`, or between the steps of a workflow's `run:` script. Put the
-  rationale above the method, the class, or the step.
+  the properties in `application.properties`, or between the steps of a
+  workflow's `run:` script. Put the rationale above the method, the class, or
+  the step.
 - **One comment per method, at most, and two lines at most.** Anything longer
   belongs in the README.
 - **No section-divider banners.** No `// ----- Redis access -----` blocks.
@@ -54,7 +54,8 @@ public ReadResult<List<TaskDto>> listTasks() {
 Every value comes from the environment and nothing has a fallback — a missing
 variable must fail the container, not start it against the wrong backend. New
 required variables go in `EnvironmentValidator.REQUIRED`, in
-`application.properties` without a default, and in `ecs/taskdef.json`.
+`application.properties` without a default, and in the task definition in
+`todo-app-infra` (see below).
 
 Credentials go in the task definition's `secrets` block with a `ValueFrom` key
 selector. Never in `environment`, never in a properties file, never in this
@@ -62,11 +63,10 @@ repository.
 
 ## Keeping in step with the infrastructure
 
-`ecs/taskdef.json` is the live source of the task definition; the copy in
-`06-alb-ecs.yaml` in `todo-app-infra` is only the bootstrap revision, because
-CloudFormation cannot update a `CODE_DEPLOY`-controlled service. Change the
-container shape in both. The container name `todo-app` appears in
-`ecs/appspec.yaml`, `ecs/taskdef.json` and that template.
+The task definition lives in `todo-app-infra`: the bootstrap revision in
+`06-alb-ecs.yaml` and the live one in the `RenderProject` buildspec in
+`07-cicd-pipeline.yaml`, because CloudFormation cannot update a
+`CODE_DEPLOY`-controlled service. Change the container shape in both.
 
 ## Before proposing a change as done
 
