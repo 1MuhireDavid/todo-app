@@ -45,25 +45,12 @@ jobs:
         uses: aws-actions/amazon-ecr-login@v2
 
       - name: Build image
-        id: image
         env:
           REGISTRY: ${{ steps.ecr.outputs.registry }}
-        run: |
-          set -euo pipefail
-          sha_tag="sha-$(git rev-parse --short=12 HEAD)"
-          echo "sha_tag=${sha_tag}" >> "$GITHUB_OUTPUT"
-          docker build \
-            --tag "${REGISTRY}/${ECR_REPOSITORY}:${sha_tag}" \
-            --tag "${REGISTRY}/${ECR_REPOSITORY}:${DEPLOY_TAG}" \
-            .
+        run: docker build --tag "${REGISTRY}/${ECR_REPOSITORY}:${DEPLOY_TAG}" .
 
-      # The sha tag triggers nothing and is what a rollback re-tags from. The
-      # EventBridge rule fires on the latest push, which starts the pipeline.
+      # The EventBridge rule fires on this push, which starts the pipeline.
       - name: Push image
         env:
           REGISTRY: ${{ steps.ecr.outputs.registry }}
-          SHA_TAG: ${{ steps.image.outputs.sha_tag }}
-        run: |
-          set -euo pipefail
-          docker push "${REGISTRY}/${ECR_REPOSITORY}:${SHA_TAG}"
-          docker push "${REGISTRY}/${ECR_REPOSITORY}:${DEPLOY_TAG}"
+        run: docker push "${REGISTRY}/${ECR_REPOSITORY}:${DEPLOY_TAG}"

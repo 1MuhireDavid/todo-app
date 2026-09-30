@@ -112,8 +112,7 @@ sized with `-XX:MaxRAMPercentage=75.0` rather than a fixed `-Xmx`, so changing
 ## Deployment
 
 `build-and-push.yml` runs on a push to `main` and does two things: build the
-image, then push it as `sha-<short12>` and as `latest`. It never reads the
-infrastructure stack.
+image, then push it as `latest`. It never reads the infrastructure stack.
 
 The push of `latest` fires an EventBridge rule that starts the pipeline in
 `todo-app-infra`. There, a CodeBuild step writes `taskdef.json` and
@@ -123,12 +122,14 @@ blue/green deploy with the new image.
 On the very first run the stack does not exist yet, so nothing is listening and
 the push only makes `latest` available for the stack to be created with.
 
-**Rolling back** does not need a rebuild. Re-tag a known-good `sha-` image as
-`latest` and push it:
+**Rolling back** does not need a rebuild. ECR keeps the 3 most recent images;
+point `latest` back at an earlier one by its digest:
 
 ```bash
+aws ecr describe-images --repository-name todo-app --region us-east-1 \
+  --query "sort_by(imageDetails,&imagePushedAt)[].[imageDigest,imagePushedAt]" --output table
 MANIFEST=$(aws ecr batch-get-image --repository-name todo-app --region us-east-1 \
-  --image-ids imageTag=sha-<known-good> --query 'images[0].imageManifest' --output text)
+  --image-ids imageDigest=<sha256:known-good> --query 'images[0].imageManifest' --output text)
 aws ecr put-image --repository-name todo-app --region us-east-1 \
   --image-tag latest --image-manifest "$MANIFEST"
 ```
