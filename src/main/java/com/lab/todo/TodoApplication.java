@@ -13,6 +13,7 @@ public class TodoApplication {
         // readable message in the task log instead of a placeholder resolution
         // failure buried in a stack trace - and the task exits immediately
         // rather than sitting in a crash loop the ALB slowly marks unhealthy.
+        
         EnvironmentValidator.validateOrExit(System.getenv());
         SpringApplication.run(TodoApplication.class, args);
     }
