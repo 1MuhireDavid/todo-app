@@ -139,7 +139,7 @@ aws ecr put-image --repository-name todo-app --region us-east-1 \
   --image-tag latest --image-manifest "$MANIFEST"
 ```
 
-Within the CodeDeploy termination wait window (10 minutes after a cutover), a
+Within the CodeDeploy termination wait window (3 minutes after a cutover), a
 faster option is shifting traffic back to the blue task set from the CodeDeploy
 console — no deploy required.
 
