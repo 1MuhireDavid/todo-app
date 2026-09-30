@@ -18,10 +18,12 @@ permissions:
   id-token: write
   contents: read
 
+# The role ARN is a secret so the account ID is masked in logs; the rest are
+# repository variables. Set them under Settings > Secrets and variables > Actions.
 env:
-  AWS_REGION: us-east-1
-  AWS_ROLE_ARN: arn:aws:iam::047719661196:role/todo-app-gha-app-build
-  ECR_REPOSITORY: todo-app
+  AWS_ROLE_ARN: ${{ secrets.AWS_ROLE_ARN }}
+  AWS_REGION: ${{ vars.AWS_REGION }}
+  ECR_REPOSITORY: ${{ vars.ECR_REPOSITORY }}
   DEPLOY_TAG: latest
 
 jobs:
@@ -32,6 +34,17 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Check repository configuration
+        run: |
+          missing=()
+          for name in AWS_ROLE_ARN AWS_REGION ECR_REPOSITORY; do
+            [ -z "${!name}" ] && missing+=("$name")
+          done
+          if [ ${#missing[@]} -gt 0 ]; then
+            echo "::error::Missing repository secrets or variables: ${missing[*]}"
+            exit 1
+          fi
 
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4

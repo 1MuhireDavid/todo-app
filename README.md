@@ -114,6 +114,11 @@ sized with `-XX:MaxRAMPercentage=75.0` rather than a fixed `-Xmx`, so changing
 `build-and-push.yml` runs on a push to `main` and does two things: build the
 image, then push it as `latest`. It never reads the infrastructure stack.
 
+It reads its configuration from the repository settings (*Settings → Secrets and
+variables → Actions*): the secret `AWS_ROLE_ARN` (the `todo-app-gha-app-build`
+role) and the variables `AWS_REGION` and `ECR_REPOSITORY`. The first step fails
+with a clear error if any of them is missing.
+
 The push of `latest` fires an EventBridge rule that starts the pipeline in
 `todo-app-infra`. There, a CodeBuild step writes `taskdef.json` and
 `appspec.yaml` from values CloudFormation passes it, and CodeDeploy runs the
