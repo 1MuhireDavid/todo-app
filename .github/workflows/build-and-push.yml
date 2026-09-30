@@ -30,7 +30,6 @@ on:
       - "Dockerfile"
       - "ecs/**"
       - ".github/workflows/build-and-push.yml"
-  workflow_dispatch:
 
 concurrency:
   group: build-and-push
