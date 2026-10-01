@@ -108,9 +108,11 @@
 
     li .title { flex: 1; }
     li.done .title { text-decoration: line-through; color: var(--muted); }
+    li input.title { padding: 4px 8px; }
 
     .row-actions button { background: transparent; color: var(--muted); padding: 4px 8px; font-size: 13px; }
     .row-actions button:hover { color: #ff6b6b; }
+    .row-actions button.edit:hover { color: var(--accent); }
 
     .empty, .error { color: var(--muted); font-size: 14px; padding: 8px 0; }
     .error { color: #ff8080; }
@@ -194,14 +196,21 @@
       const title = document.createElement('span');
       title.className = 'title';
       title.textContent = task.title;
+      title.title = 'Double-click to edit';
+      title.addEventListener('dblclick', () => startEdit(task, title));
 
       const actions = document.createElement('span');
       actions.className = 'row-actions';
+      const edit = document.createElement('button');
+      edit.type = 'button';
+      edit.className = 'edit';
+      edit.textContent = 'Edit';
+      edit.addEventListener('click', () => startEdit(task, title));
       const del = document.createElement('button');
       del.type = 'button';
       del.textContent = 'Delete';
       del.addEventListener('click', () => remove(task.id));
-      actions.appendChild(del);
+      actions.append(edit, del);
 
       li.append(check, title, actions);
       list.appendChild(li);
@@ -229,6 +238,37 @@
 
   async function toggle(task, completed) {
     await send('PUT', '/api/tasks/' + task.id, { title: task.title, completed });
+  }
+
+  function startEdit(task, title) {
+    if (!title.isConnected) return;
+    const input = document.createElement('input');
+    input.type = 'text';
+    input.className = 'title';
+    input.value = task.title;
+    input.maxLength = 200;
+
+    let finished = false;
+    const finish = async (save) => {
+      if (finished) return;
+      finished = true;
+      const next = input.value.trim();
+      if (save && next && next !== task.title) {
+        await send('PUT', '/api/tasks/' + task.id, { title: next, completed: task.completed });
+      }
+      // A successful save re-renders the list; anything else leaves the input to put back.
+      if (input.isConnected) input.replaceWith(title);
+    };
+
+    input.addEventListener('keydown', (event) => {
+      if (event.key === 'Enter') finish(true);
+      else if (event.key === 'Escape') finish(false);
+    });
+    input.addEventListener('blur', () => finish(true));
+
+    title.replaceWith(input);
+    input.focus();
+    input.select();
   }
 
   async function remove(id) {

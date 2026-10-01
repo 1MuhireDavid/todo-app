@@ -67,8 +67,6 @@ public class TaskService {
                 });
                 return new ReadResult<>(items, true, SOURCE_CACHE, millisSince(start));
             } catch (Exception e) {
-                // A value we cannot parse is a value from an older version of
-                // this code. Drop it and fall through to the database.
                 log.warn("Discarding unparseable cache entry for {}: {}", KEY_ALL, e.getMessage());
                 deleteFromCache(KEY_ALL);
             }
